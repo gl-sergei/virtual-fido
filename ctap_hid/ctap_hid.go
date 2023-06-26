@@ -241,7 +241,8 @@ func (channel *ctapHIDChannel) handleInitializationMessage(message []byte) {
 		ctapHIDLogger.Printf("CTAPHID: Read %d bytes, Need %d more\n\n",
 			len(payload), int(payloadLength)-len(payload))
 		channel.inProgressHeader = &header
-		channel.inProgressPayload = payload
+		channel.inProgressPayload = make([]byte, len(payload))
+		copy(channel.inProgressPayload, payload)
 		channel.inProgressSequenceNumber = 0
 	} else {
 		go channel.handleFinalizedMessage(header, payload[:payloadLength])
