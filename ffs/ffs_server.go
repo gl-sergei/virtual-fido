@@ -9,7 +9,6 @@ import (
 	"syscall"
 
 	"github.com/bulwarkid/virtual-fido/ctap_hid"
-	"github.com/bulwarkid/virtual-fido/usbip"
 	"github.com/bulwarkid/virtual-fido/util"
 )
 
@@ -100,7 +99,7 @@ func (ep *Endpoint) Close() {
 // FFS types
 
 type USBFunctionFSEvent struct {
-	Setup usbip.USBSetupPacket
+	Setup usbSetupPacket
 	Type  uint8
 	Pad   [3]uint8
 }
@@ -121,6 +120,7 @@ const (
 type FFSServer struct {
 	ctapHid       *ctap_hid.CTAPHIDServer
 	responseMutex *sync.Mutex
+	response      []byte
 }
 
 func NewFFSServer(ctapHid *ctap_hid.CTAPHIDServer) *FFSServer {
@@ -139,6 +139,13 @@ func (server *FFSServer) Start() {
 	ep1 := NewEndpoint("ep1")
 	ep2 := NewEndpoint("ep2")
 
+	responseHandler := func(response []byte) {
+		server.responseMutex.Lock()
+		server.response = append(server.response, response...)
+		server.responseMutex.Unlock()
+	}
+	server.ctapHid.SetResponseHandler(responseHandler)
+
 	server.handleEps(ep0, ep1, ep2)
 
 	for _, ep := range []*Endpoint{ep0, ep1, ep2} {
@@ -155,9 +162,9 @@ func (server *FFSServer) getHIDReport() []byte {
 
 func (server *FFSServer) getFFSDescHeader() USBFunctionFSDescsHeadV2 {
 	totalLength := uint32(util.SizeOf[USBFunctionFSDescsHeadV2]()) + uint32(4) +
-		uint32(util.SizeOf[usbip.USBInterfaceDescriptor]()) +
-		uint32(util.SizeOf[usbip.USBHIDDescriptor]()) +
-		uint32(util.SizeOf[usbip.USBEndpointDescriptor]()*2)
+		uint32(util.SizeOf[usbInterfaceDescriptor]()) +
+		uint32(util.SizeOf[usbHIDDescriptor]()) +
+		uint32(util.SizeOf[usbEndpointDescriptor]()*2)
 	return USBFunctionFSDescsHeadV2{
 		magic:  FUNCTIONFS_DESCRIPTORS_MAGIC_V2,
 		flags:  FUNCTIONFS_HAS_HS_DESC,
@@ -165,12 +172,12 @@ func (server *FFSServer) getFFSDescHeader() USBFunctionFSDescsHeadV2 {
 	}
 }
 
-func (server *FFSServer) getEndpointDescriptors() []usbip.USBEndpointDescriptor {
-	length := util.SizeOf[usbip.USBEndpointDescriptor]()
-	return []usbip.USBEndpointDescriptor{
+func (server *FFSServer) getEndpointDescriptors() []usbEndpointDescriptor {
+	length := util.SizeOf[usbEndpointDescriptor]()
+	return []usbEndpointDescriptor{
 		{
 			BLength:          length,
-			BDescriptorType:  usbip.USB_DESCRIPTOR_ENDPOINT,
+			BDescriptorType:  usbDescriptorEndpoint,
 			BEndpointAddress: 0b10000001,
 			BmAttributes:     0b00000011,
 			WMaxPacketSize:   64,
@@ -178,7 +185,7 @@ func (server *FFSServer) getEndpointDescriptors() []usbip.USBEndpointDescriptor 
 		},
 		{
 			BLength:          length,
-			BDescriptorType:  usbip.USB_DESCRIPTOR_ENDPOINT,
+			BDescriptorType:  usbDescriptorEndpoint,
 			BEndpointAddress: 0b00000010,
 			BmAttributes:     0b00000011,
 			WMaxPacketSize:   64,
@@ -187,28 +194,28 @@ func (server *FFSServer) getEndpointDescriptors() []usbip.USBEndpointDescriptor 
 	}
 }
 
-func (server *FFSServer) getInterfaceDescriptor() usbip.USBInterfaceDescriptor {
-	return usbip.USBInterfaceDescriptor{
-		BLength:            util.SizeOf[usbip.USBInterfaceDescriptor](),
-		BDescriptorType:    usbip.USB_DESCRIPTOR_INTERFACE,
+func (server *FFSServer) getInterfaceDescriptor() usbInterfaceDescriptor {
+	return usbInterfaceDescriptor{
+		BLength:            util.SizeOf[usbInterfaceDescriptor](),
+		BDescriptorType:    usbDescriptorInterface,
 		BInterfaceNumber:   0,
 		BAlternateSetting:  0,
 		BNumEndpoints:      2,
-		BInterfaceClass:    usbip.USB_INTERFACE_CLASS_HID,
+		BInterfaceClass:    usbInterfaceClassHID,
 		BInterfaceSubclass: 0,
 		BInterfaceProtocol: 0,
 		IInterface:         5,
 	}
 }
 
-func (server *FFSServer) getHIDDescriptor(hidReportDescriptor []byte) usbip.USBHIDDescriptor {
-	return usbip.USBHIDDescriptor{
-		BLength:                 util.SizeOf[usbip.USBHIDDescriptor](),
-		BDescriptorType:         usbip.USB_DESCRIPTOR_HID,
+func (server *FFSServer) getHIDDescriptor(hidReportDescriptor []byte) usbHIDDescriptor {
+	return usbHIDDescriptor{
+		BLength:                 util.SizeOf[usbHIDDescriptor](),
+		BDescriptorType:         usbDescriptorHID,
 		BcdHID:                  0x0101,
 		BCountryCode:            0,
 		BNumDescriptors:         1,
-		BClassDescriptorType:    usbip.USB_DESCRIPTOR_HID_REPORT,
+		BClassDescriptorType:    usbDescriptorHIDReport,
 		WReportDescriptorLength: uint16(len(hidReportDescriptor)),
 	}
 }
@@ -258,7 +265,7 @@ func (server *FFSServer) deviceStrings() []byte {
 	buffer := new(bytes.Buffer)
 	header := server.getFFSStringsHeader()
 	buffer.Write(util.ToLE(header))
-	buffer.Write(util.ToLE(uint16(usbip.USB_LANGID_ENG_USA)))
+	buffer.Write(util.ToLE(uint16(usbLangIDEngUSA)))
 	for _, s := range server.getStrings() {
 		buffer.Write(append([]byte(s), 0))
 	}
@@ -305,11 +312,13 @@ func (server *FFSServer) handleEpIn(idx uint32, ep *Endpoint) {
 	ffsLogger.Println("start handling ep in")
 	var id uint32 = 0
 	for {
-		response := server.ctapHid.GetResponse(id, 10000)
-		if response != nil && len(response) > 0 {
-			ep.Write(response)
+		server.responseMutex.Lock()
+		if server.response != nil && len(server.response) > 0 {
+			ep.Write(server.response)
 		}
+		server.response = nil
 		id = id + 1
+		server.responseMutex.Unlock()
 	}
 }
 
@@ -328,7 +337,7 @@ func (server *FFSServer) handleEp0(idx uint32, ep *Endpoint) {
 			case FUNCTIONFS_SUSPEND:
 			case FUNCTIONFS_RESUME:
 			case FUNCTIONFS_SETUP:
-				if ev.Setup.BmRequestType&0x80 == 0x80 && ev.Setup.BRequest == usbip.USBRequestType(usbip.USB_HID_REQUEST_GET_DESCRIPTOR) {
+				if ev.Setup.BmRequestType&0x80 == 0x80 && ev.Setup.BRequest == usbRequestGetDescriptor {
 					ffsLogger.Println("setup packet: ", ev.Setup)
 					submitResponse := func(n int) {
 						if n > 0 {
