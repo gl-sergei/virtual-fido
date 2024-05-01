@@ -353,5 +353,4 @@ func (server *FFSServer) handleEp0(idx uint32, ep *Endpoint) {
 			}
 		}
 	}
-
 }
